@@ -14,6 +14,7 @@ $unusedSecurityGroups = @()
 $sgWithNetworkInterfaces = @()
 $sgCompletelyUnused = @()
 $sgReferencedByOtherSGs = @()
+$sgDefaultGroups = @()
 
 # For progress tracking
 $totalRegions = $Regions.Count
@@ -60,9 +61,21 @@ foreach ($region in $Regions) {
         }
         
         $networkInterfacesData = $allNetworkInterfaces | ConvertFrom-Json
-        
-        # OPTIMIZATION: Build lookup tables for efficient searching instead of individual API calls
+          # OPTIMIZATION: Build lookup tables for efficient searching instead of individual API calls
         Write-Host "Building lookup tables for efficient analysis..." -ForegroundColor Cyan
+        
+        # Build default security groups lookup
+        $defaultSecurityGroups = @{}
+        foreach ($sg in $securityGroupsData.SecurityGroups) {
+            if ($sg.GroupName -eq "default") {
+                $defaultSecurityGroups[$sg.GroupId] = @{
+                    GroupId = $sg.GroupId
+                    GroupName = $sg.GroupName
+                    VpcId = $sg.VpcId
+                    IsDefault = $true
+                }
+            }
+        }
         
         # Build instance security groups lookup
         $instanceSecurityGroups = @{}
@@ -174,15 +187,44 @@ foreach ($region in $Regions) {
                         $instanceName = if ($instance.InstanceName) { " ($($instance.InstanceName))" } else { "" }
                         Write-Host "  - Instance ID: $($instance.InstanceId)$instanceName - State: $($instance.State)" -ForegroundColor White
                     }
-                }
-            } else {
+                }            } else {
+                # Check if this is a default security group
+                $isDefaultSG = $defaultSecurityGroups.ContainsKey($groupId)
+                
                 # Check for network interfaces using lookup table
                 $attachedNetworkInterfaces = $networkInterfaceSecurityGroups[$groupId]
                 
                 # Check for security group references using lookup table
                 $referencedBy = $securityGroupReferences[$groupId]
                 
-                if ($attachedNetworkInterfaces -and $referencedBy) {
+                if ($isDefaultSG) {
+                    # This is a default security group - should not be deleted
+                    $unusedSecurityGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        ReferencedBy = $referencedBy
+                        Category = "DefaultSecurityGroup"
+                        IsDefault = $true
+                    }
+                    $sgDefaultGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        ReferencedBy = $referencedBy
+                        IsDefault = $true
+                    }
+                    
+                    if ($Verbose) {
+                        Write-Host "[DEFAULT-SECURITY-GROUP] This is a default VPC security group - should NOT be deleted" -ForegroundColor Blue
+                    }
+                } elseif ($attachedNetworkInterfaces -and $referencedBy) {
                     # Has both network interfaces and references
                     $unusedSecurityGroups += @{
                         Region = $region
@@ -315,9 +357,35 @@ if ($Verbose) {
     Write-Host "="*80 -ForegroundColor Magenta
 
     if ($unusedSecurityGroups.Count -eq 0) {
-        Write-Host "All security groups are currently in use by EC2 instances." -ForegroundColor Green
-    } else {
+        Write-Host "All security groups are currently in use by EC2 instances." -ForegroundColor Green    } else {
         Write-Host "Found $($unusedSecurityGroups.Count) security group(s) with no EC2 instances attached." -ForegroundColor Yellow
+    }
+
+    # Output default security groups first (most important warning)
+    Write-Host "`n" + "-"*80 -ForegroundColor Blue
+    Write-Host "Default VPC Security Groups (NEVER DELETE - AWS Managed)" -ForegroundColor Blue
+    Write-Host "-"*80 -ForegroundColor Blue
+
+    if ($sgDefaultGroups.Count -eq 0) {
+        Write-Host "No default security groups found without instances." -ForegroundColor Green
+    } else {
+        Write-Host "Found $($sgDefaultGroups.Count) default security group(s) with no EC2 instances:" -ForegroundColor Blue
+        Write-Host "WARNING: These are AWS-managed default security groups and should NEVER be deleted!" -ForegroundColor Red
+        
+        # Group by region for better display
+        $groupedDefaultSGs = $sgDefaultGroups | Group-Object -Property Region
+        
+        foreach ($regionGroup in $groupedDefaultSGs) {
+            Write-Host "`nRegion: $($regionGroup.Name)" -ForegroundColor Cyan
+            foreach ($sg in $regionGroup.Group) {
+                Write-Host "  - $($sg.GroupId) ($($sg.GroupName)) - VPC: $($sg.VpcId)" -ForegroundColor White
+            }
+        }
+        
+        Write-Host "`nPlain list for scripting (default security groups - DO NOT DELETE):" -ForegroundColor Gray
+        foreach ($sg in $sgDefaultGroups) {
+            Write-Host "$($sg.Region):$($sg.GroupId) [DEFAULT-VPC-SG-DO-NOT-DELETE]" -ForegroundColor Blue
+        }
     }
 
     # Output completely unused security groups
@@ -329,15 +397,17 @@ if ($Verbose) {
         Write-Host "No completely unused security groups found." -ForegroundColor Green
     } else {
         Write-Host "Found $($sgCompletelyUnused.Count) security group(s) that are completely unused:" -ForegroundColor Red
-        
-        # Group by region for better display
+          # Group by region for better display
         $groupedCompletelyUnused = $sgCompletelyUnused | Group-Object -Property Region
-          foreach ($regionGroup in $groupedCompletelyUnused) {
+        
+        foreach ($regionGroup in $groupedCompletelyUnused) {
             Write-Host "`nRegion: $($regionGroup.Name)" -ForegroundColor Cyan
             foreach ($sg in $regionGroup.Group) {
                 Write-Host "  - $($sg.GroupId) ($($sg.GroupName))" -ForegroundColor White
             }
-        }Write-Host "`nPlain list for scripting (completely unused):" -ForegroundColor Gray
+        }
+        
+        Write-Host "`nPlain list for scripting (completely unused):" -ForegroundColor Gray
         foreach ($sg in $sgCompletelyUnused) {
             Write-Host "$($sg.Region):$($sg.GroupId) [SAFE-TO-DELETE]" -ForegroundColor DarkRed
         }
@@ -401,29 +471,42 @@ Write-Host "`n" + "="*80 -ForegroundColor Magenta
 Write-Host "FINAL SUMMARY" -ForegroundColor Magenta
 Write-Host "="*80 -ForegroundColor Magenta
 Write-Host "Total Security Groups with no EC2 instances: $($unusedSecurityGroups.Count)" -ForegroundColor Yellow
+Write-Host "  ├─ Default VPC security groups (NEVER delete): $($sgDefaultGroups.Count)" -ForegroundColor Blue
 Write-Host "  ├─ Completely unused (safe to delete): $($sgCompletelyUnused.Count)" -ForegroundColor Red
 Write-Host "  ├─ Attached to network interfaces (review needed): $($sgWithNetworkInterfaces.Count)" -ForegroundColor Yellow
 Write-Host "  └─ Referenced by other security groups (review needed): $($sgReferencedByOtherSGs.Count)" -ForegroundColor Yellow
 
-if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0 -or $sgReferencedByOtherSGs.Count -gt 0) {
+if ($sgDefaultGroups.Count -gt 0 -or $sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0 -or $sgReferencedByOtherSGs.Count -gt 0) {
     Write-Host "`nBreakdown by region:" -ForegroundColor Cyan
-    foreach ($region in $Regions) {
+    foreach ($region in $Regions) {        $defaultInRegion = ($sgDefaultGroups | Where-Object { $_.Region -eq $region }).Count
         $completelyUnusedInRegion = ($sgCompletelyUnused | Where-Object { $_.Region -eq $region }).Count
         $withNIInRegion = ($sgWithNetworkInterfaces | Where-Object { $_.Region -eq $region }).Count
         $referencedInRegion = ($sgReferencedByOtherSGs | Where-Object { $_.Region -eq $region }).Count
-        if ($completelyUnusedInRegion -gt 0 -or $withNIInRegion -gt 0 -or $referencedInRegion -gt 0) {
-            Write-Host "  $region`: $completelyUnusedInRegion completely unused, $withNIInRegion with network interfaces, $referencedInRegion referenced by other SGs" -ForegroundColor White
+        
+        if ($defaultInRegion -gt 0 -or $completelyUnusedInRegion -gt 0 -or $withNIInRegion -gt 0 -or $referencedInRegion -gt 0) {
+            Write-Host "  $region`: $defaultInRegion default (never delete), $completelyUnusedInRegion completely unused, $withNIInRegion with network interfaces, $referencedInRegion referenced by other SGs" -ForegroundColor White
         }
     }
     
     # Combined list with clear labels
     Write-Host "`nCOMBINED LIST (All unused security groups with status):" -ForegroundColor Magenta
-    Write-Host "Legend: [SAFE-TO-DELETE] = No instances, no network interfaces, not referenced" -ForegroundColor DarkRed
+    Write-Host "Legend: [DEFAULT-VPC-SG-DO-NOT-DELETE] = Default VPC security group - AWS managed" -ForegroundColor Blue
+    Write-Host "        [SAFE-TO-DELETE] = No instances, no network interfaces, not referenced" -ForegroundColor DarkRed
     Write-Host "        [HAS-NETWORK-INTERFACES] = No instances, but has network interfaces" -ForegroundColor DarkYellow
     Write-Host "        [REFERENCED-BY-OTHER-SGs] = No instances, but referenced by other security groups" -ForegroundColor DarkYellow
     Write-Host ""
       # Sort by region then by security group ID for consistent output
     $allUnused = @()
+    foreach ($sg in $sgDefaultGroups) {
+        $allUnused += [PSCustomObject]@{
+            Region = $sg.Region
+            SecurityGroupId = $sg.GroupId
+            SecurityGroupName = $sg.GroupName
+            Status = "DEFAULT-VPC-SG-DO-NOT-DELETE"
+            Color = "Blue"
+            SortOrder = 1
+        }
+    }
     foreach ($sg in $sgCompletelyUnused) {
         $allUnused += [PSCustomObject]@{
             Region = $sg.Region
@@ -431,6 +514,7 @@ if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0 -or
             SecurityGroupName = $sg.GroupName
             Status = "SAFE-TO-DELETE"
             Color = "DarkRed"
+            SortOrder = 2
         }
     }
     foreach ($sg in $sgWithNetworkInterfaces) {
@@ -440,19 +524,23 @@ if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0 -or
             SecurityGroupName = $sg.GroupName
             Status = "HAS-NETWORK-INTERFACES"
             Color = "DarkYellow"
-        }
-    }
-    foreach ($sg in $sgReferencedByOtherSGs) {
+            SortOrder = 3
+        }    }    foreach ($sg in $sgReferencedByOtherSGs) {
         $allUnused += [PSCustomObject]@{
             Region = $sg.Region
             SecurityGroupId = $sg.GroupId
             SecurityGroupName = $sg.GroupName
             Status = "REFERENCED-BY-OTHER-SGs"
             Color = "DarkYellow"
+            SortOrder = 4
         }
     }
-      $sortedUnused = $allUnused | Sort-Object Region, SecurityGroupId
+    
+    # Sort by Region, then by State (SortOrder), then by SecurityGroupId
+    $sortedUnused = $allUnused | Sort-Object Region, SortOrder, SecurityGroupId
     foreach ($sg in $sortedUnused) {
         Write-Host "$($sg.Region):$($sg.SecurityGroupId) [$($sg.Status)]" -ForegroundColor $sg.Color
     }
 }
+
+
