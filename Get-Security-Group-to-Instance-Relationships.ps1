@@ -1,4 +1,5 @@
 # PowerShell script to get all security groups and find instances using them
+# Optimized version with reduced API calls
 # Requires AWS CLI to be installed and configured
 
 param(
@@ -6,140 +7,297 @@ param(
     [switch]$Verbose
 )
 
-Write-Host "Starting security group analysis for regions: $($Regions -join ', ')" -ForegroundColor Green
+Write-Host "Starting optimized security group analysis for regions: $($Regions -join ', ')" -ForegroundColor Green
 
 # Track security groups with no instances
 $unusedSecurityGroups = @()
 $sgWithNetworkInterfaces = @()
 $sgCompletelyUnused = @()
+$sgReferencedByOtherSGs = @()
 
-# For progress tracking in non-verbose mode
-$totalSecurityGroups = 0
-$processedSecurityGroups = 0
-
-# First pass: count total security groups for progress bar
-if (-not $Verbose) {
-    Write-Host "Counting security groups..." -ForegroundColor Cyan
-    foreach ($region in $Regions) {
-        try {
-            $securityGroups = aws ec2 describe-security-groups --region $region --query "SecurityGroups[*].GroupId" --output text
-            if ($LASTEXITCODE -eq 0 -and ![string]::IsNullOrWhiteSpace($securityGroups)) {
-                $sgIds = $securityGroups -split "`t" | Where-Object { $_.Trim() -ne "" }
-                $totalSecurityGroups += $sgIds.Count
-            }
-        }
-        catch {
-            # Ignore errors during counting
-        }
-    }
-    Write-Host "Found $totalSecurityGroups total security groups to analyze." -ForegroundColor Green
-}
+# For progress tracking
+$totalRegions = $Regions.Count
+$processedRegions = 0
 
 foreach ($region in $Regions) {
+    $processedRegions++
+    
     if ($Verbose) {
-        Write-Host "`nProcessing region: $region" -ForegroundColor Yellow
+        Write-Host "`n=== Region: $region ($processedRegions/$totalRegions) ===" -ForegroundColor Yellow
+    } else {
+        Write-Host "`nProcessing region $region ($processedRegions/$totalRegions)..." -ForegroundColor Yellow
     }
-      try {
-        # Get all security groups in the region
-        if ($Verbose) {
-            Write-Host "Retrieving security groups from $region..." -ForegroundColor Cyan
-        }
-        $securityGroups = aws ec2 describe-security-groups --region $region --query "SecurityGroups[*].GroupId" --output text
-        
+    
+    try {
+        # OPTIMIZATION: Fetch all data for the region in bulk to minimize API calls
+        Write-Host "Fetching security groups data for $region..." -ForegroundColor Cyan
+        $allSecurityGroups = aws ec2 describe-security-groups --region $region --output json
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to retrieve security groups from region $region"
-            continue
-        }
-          if ([string]::IsNullOrWhiteSpace($securityGroups)) {
-            if ($Verbose) {
-                Write-Host "No security groups found in region $region" -ForegroundColor Gray
-            }
+            Write-Host "Error fetching security groups for region $region" -ForegroundColor Red
             continue
         }
         
-        # Split the security group IDs (AWS CLI returns tab-separated values)
-        $sgIds = $securityGroups -split "`t" | Where-Object { $_.Trim() -ne "" }
-        
-        if ($Verbose) {
-            Write-Host "Found $($sgIds.Count) security groups in $region" -ForegroundColor Green
+        $securityGroupsData = $allSecurityGroups | ConvertFrom-Json
+        if (-not $securityGroupsData.SecurityGroups -or $securityGroupsData.SecurityGroups.Count -eq 0) {
+            Write-Host "No security groups found in region $region" -ForegroundColor Yellow
+            continue
         }
-          foreach ($sgId in $sgIds) {
-            $sgId = $sgId.Trim()
-            if ([string]::IsNullOrWhiteSpace($sgId)) { continue }
-            
-            # Update progress bar in non-verbose mode
-            if (-not $Verbose) {
-                $processedSecurityGroups++
-                $percentComplete = [math]::Round(($processedSecurityGroups / $totalSecurityGroups) * 100, 1)
-                Write-Progress -Activity "Analyzing Security Groups" -Status "Processing $sgId ($processedSecurityGroups of $totalSecurityGroups)" -PercentComplete $percentComplete
+        
+        Write-Host "Fetching instances data for $region..." -ForegroundColor Cyan
+        $allInstances = aws ec2 describe-instances --region $region --output json
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Error fetching instances for region $region" -ForegroundColor Red
+            continue
+        }
+        
+        $instancesData = $allInstances | ConvertFrom-Json
+        
+        Write-Host "Fetching network interfaces data for $region..." -ForegroundColor Cyan
+        $allNetworkInterfaces = aws ec2 describe-network-interfaces --region $region --output json
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Error fetching network interfaces for region $region" -ForegroundColor Red
+            continue
+        }
+        
+        $networkInterfacesData = $allNetworkInterfaces | ConvertFrom-Json
+        
+        # OPTIMIZATION: Build lookup tables for efficient searching instead of individual API calls
+        Write-Host "Building lookup tables for efficient analysis..." -ForegroundColor Cyan
+        
+        # Build instance security groups lookup
+        $instanceSecurityGroups = @{}
+        foreach ($reservation in $instancesData.Reservations) {
+            foreach ($instance in $reservation.Instances) {
+                foreach ($sg in $instance.SecurityGroups) {
+                    if (-not $instanceSecurityGroups.ContainsKey($sg.GroupId)) {
+                        $instanceSecurityGroups[$sg.GroupId] = @()
+                    }
+                    $instanceSecurityGroups[$sg.GroupId] += @{
+                        InstanceId = $instance.InstanceId
+                        InstanceName = ($instance.Tags | Where-Object { $_.Key -eq "Name" }).Value
+                        State = $instance.State.Name
+                    }
+                }
             }
-            
-            if ($Verbose) {
-                Write-Host "`n  Checking instances for security group: $sgId" -ForegroundColor White
+        }
+        
+        # Build network interface security groups lookup
+        $networkInterfaceSecurityGroups = @{}
+        foreach ($ni in $networkInterfacesData.NetworkInterfaces) {
+            foreach ($sg in $ni.Groups) {
+                if (-not $networkInterfaceSecurityGroups.ContainsKey($sg.GroupId)) {
+                    $networkInterfaceSecurityGroups[$sg.GroupId] = @()
+                }
+                $networkInterfaceSecurityGroups[$sg.GroupId] += @{
+                    NetworkInterfaceId = $ni.NetworkInterfaceId
+                    Description = $ni.Description
+                    Status = $ni.Status
+                    VpcId = $ni.VpcId
+                }
             }
-            
-            try {
-                # Get instances using this security group
-                $instances = aws ec2 describe-instances --filters "Name=instance.group-id,Values=$sgId" --query "Reservations[*].Instances[*].Tags[?Key=='Name'].Value" --output text --region $region
-                
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Warning "Failed to query instances for security group $sgId in region $region"
-                    continue
-                }                if ([string]::IsNullOrWhiteSpace($instances)) {
-                    if ($Verbose) {
-                        Write-Host "    No instances found using security group $sgId" -ForegroundColor Gray
-                    }
-                    
-                    # Check if security group is attached to network interfaces
-                    if ($Verbose) {
-                        Write-Host "    Checking network interfaces for security group $sgId..." -ForegroundColor DarkGray
-                    }
-                    $networkInterfaces = aws ec2 describe-network-interfaces --filters "Name=group-id,Values=$sgId" --query "NetworkInterfaces[*].NetworkInterfaceId" --output text --region $region
-                    
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Warning "Failed to query network interfaces for security group $sgId in region $region"
-                        continue
-                    }
-                    
-                    $sgObject = [PSCustomObject]@{
-                        Region = $region
-                        SecurityGroupId = $sgId
-                    }
-                      if ([string]::IsNullOrWhiteSpace($networkInterfaces)) {
-                        if ($Verbose) {
-                            Write-Host "    No network interfaces found for security group $sgId" -ForegroundColor DarkGray
+        }
+        
+        # Build security group references lookup
+        $securityGroupReferences = @{}
+        foreach ($sg in $securityGroupsData.SecurityGroups) {
+            # Check ingress rules
+            foreach ($rule in $sg.IpPermissions) {
+                foreach ($userIdGroupPair in $rule.UserIdGroupPairs) {
+                    if ($userIdGroupPair.GroupId) {
+                        if (-not $securityGroupReferences.ContainsKey($userIdGroupPair.GroupId)) {
+                            $securityGroupReferences[$userIdGroupPair.GroupId] = @()
                         }
-                        $sgCompletelyUnused += $sgObject
-                    } else {
-                        $niIds = $networkInterfaces -split "`t" | Where-Object { $_.Trim() -ne "" }
-                        if ($Verbose) {
-                            Write-Host "    Found $($niIds.Count) network interface(s) using security group $sgId" -ForegroundColor Yellow
-                        }
-                        $sgWithNetworkInterfaces += $sgObject
-                    }
-                    
-                    # Add to general unused list for backward compatibility
-                    $unusedSecurityGroups += $sgObject                } else {
-                    # Split instance names (AWS CLI returns tab-separated values)
-                    $instanceNames = $instances -split "`t" | Where-Object { $_.Trim() -ne "" }
-                    if ($Verbose) {
-                        Write-Host "    Found $($instanceNames.Count) instance(s):" -ForegroundColor Green
-                        foreach ($instanceName in $instanceNames) {
-                            $instanceName = $instanceName.Trim()
-                            if (![string]::IsNullOrWhiteSpace($instanceName)) {
-                                Write-Host "      - $instanceName" -ForegroundColor Cyan
-                            }
+                        $securityGroupReferences[$userIdGroupPair.GroupId] += @{
+                            ReferencedBy = $sg.GroupId
+                            ReferencedByName = $sg.GroupName
+                            RuleType = "Ingress"
+                            Protocol = $rule.IpProtocol
+                            FromPort = $rule.FromPort
+                            ToPort = $rule.ToPort
                         }
                     }
                 }
             }
-            catch {
-                Write-Warning "Error querying instances for security group $sgId`: $($_.Exception.Message)"
+            
+            # Check egress rules
+            foreach ($rule in $sg.IpPermissionsEgress) {
+                foreach ($userIdGroupPair in $rule.UserIdGroupPairs) {
+                    if ($userIdGroupPair.GroupId) {
+                        if (-not $securityGroupReferences.ContainsKey($userIdGroupPair.GroupId)) {
+                            $securityGroupReferences[$userIdGroupPair.GroupId] = @()
+                        }
+                        $securityGroupReferences[$userIdGroupPair.GroupId] += @{
+                            ReferencedBy = $sg.GroupId
+                            ReferencedByName = $sg.GroupName
+                            RuleType = "Egress"
+                            Protocol = $rule.IpProtocol
+                            FromPort = $rule.FromPort
+                            ToPort = $rule.ToPort
+                        }
+                    }
+                }
             }
         }
+        
+        $regionSgCount = $securityGroupsData.SecurityGroups.Count
+        $processedInRegion = 0
+        
+        Write-Host "Analyzing $regionSgCount security groups in $region..." -ForegroundColor Green
+        
+        # OPTIMIZATION: Process all security groups using pre-built lookup tables
+        foreach ($sg in $securityGroupsData.SecurityGroups) {
+            $processedInRegion++
+            
+            if (-not $Verbose) {
+                $overallProgress = [math]::Round((($processedRegions - 1) * 100 + ($processedInRegion / $regionSgCount * 100)) / $totalRegions)
+                Write-Progress -Activity "Analyzing Security Groups" -Status "Region: $region - Processing $($sg.GroupId) ($processedInRegion/$regionSgCount)" -PercentComplete $overallProgress
+            }
+            
+            $groupId = $sg.GroupId
+            $groupName = $sg.GroupName
+            $description = $sg.Description
+            $vpcId = $sg.VpcId
+            
+            # Check if this security group is attached to any instances using lookup table
+            $attachedInstances = $instanceSecurityGroups[$groupId]
+            
+            if ($Verbose) {
+                Write-Host "`nSecurity Group: $groupName ($groupId)" -ForegroundColor Cyan
+                Write-Host "Description: $description" -ForegroundColor Gray
+                Write-Host "VPC: $vpcId" -ForegroundColor Gray
+            }
+            
+            if ($attachedInstances) {
+                if ($Verbose) {
+                    Write-Host "Attached to the following instances:" -ForegroundColor Green
+                    foreach ($instance in $attachedInstances) {
+                        $instanceName = if ($instance.InstanceName) { " ($($instance.InstanceName))" } else { "" }
+                        Write-Host "  - Instance ID: $($instance.InstanceId)$instanceName - State: $($instance.State)" -ForegroundColor White
+                    }
+                }
+            } else {
+                # Check for network interfaces using lookup table
+                $attachedNetworkInterfaces = $networkInterfaceSecurityGroups[$groupId]
+                
+                # Check for security group references using lookup table
+                $referencedBy = $securityGroupReferences[$groupId]
+                
+                if ($attachedNetworkInterfaces -and $referencedBy) {
+                    # Has both network interfaces and references
+                    $unusedSecurityGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        ReferencedBy = $referencedBy
+                        Category = "HasNetworkInterfacesAndReferences"
+                    }
+                    $sgWithNetworkInterfaces += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        ReferencedBy = $referencedBy
+                    }
+                    $sgReferencedByOtherSGs += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        ReferencedBy = $referencedBy
+                    }
+                } elseif ($attachedNetworkInterfaces) {
+                    # Has network interfaces only
+                    $unusedSecurityGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                        Category = "HasNetworkInterfaces"
+                    }
+                    $sgWithNetworkInterfaces += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        NetworkInterfaces = $attachedNetworkInterfaces
+                    }
+                    
+                    if ($Verbose) {
+                        Write-Host "[HAS-NETWORK-INTERFACES] No instances found, but attached to network interfaces:" -ForegroundColor Yellow
+                        foreach ($ni in $attachedNetworkInterfaces) {
+                            Write-Host "  - Network Interface: $($ni.NetworkInterfaceId) - Status: $($ni.Status) - Description: $($ni.Description)" -ForegroundColor White
+                        }
+                    }
+                } elseif ($referencedBy) {
+                    # Referenced by other security groups only
+                    $unusedSecurityGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        ReferencedBy = $referencedBy
+                        Category = "ReferencedByOtherSGs"
+                    }
+                    $sgReferencedByOtherSGs += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        ReferencedBy = $referencedBy
+                    }
+                    
+                    if ($Verbose) {
+                        Write-Host "[REFERENCED-BY-OTHER-SGs] No instances found, but referenced by other security groups:" -ForegroundColor Magenta
+                        foreach ($ref in $referencedBy) {
+                            Write-Host "  - Referenced by: $($ref.ReferencedByName) ($($ref.ReferencedBy)) - $($ref.RuleType) - Protocol: $($ref.Protocol)" -ForegroundColor White
+                        }
+                    }
+                } else {
+                    # Completely unused
+                    $unusedSecurityGroups += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                        Category = "CompletelyUnused"
+                    }
+                    $sgCompletelyUnused += @{
+                        Region = $region
+                        GroupId = $groupId
+                        GroupName = $groupName
+                        Description = $description
+                        VpcId = $vpcId
+                    }
+                    
+                    if ($Verbose) {
+                        Write-Host "[SAFE-TO-DELETE] No instances, network interfaces, or references found" -ForegroundColor Red
+                    }
+                }
+            }
+        }
+        
+        if (-not $Verbose) {
+            Write-Progress -Activity "Analyzing Security Groups" -Completed
+        }
+        
+        Write-Host "Completed analysis for region $region" -ForegroundColor Green
+        
+    } catch {
+        Write-Error "Error processing region $region`: $($_.Exception.Message)"
     }
-    catch {
-        Write-Error "Error processing region $region`: $($_.Exception.Message)"    }
 }
 
 # Complete the progress indicator for non-verbose mode
@@ -174,16 +332,14 @@ if ($Verbose) {
         
         # Group by region for better display
         $groupedCompletelyUnused = $sgCompletelyUnused | Group-Object -Property Region
-        
-        foreach ($regionGroup in $groupedCompletelyUnused) {
+          foreach ($regionGroup in $groupedCompletelyUnused) {
             Write-Host "`nRegion: $($regionGroup.Name)" -ForegroundColor Cyan
             foreach ($sg in $regionGroup.Group) {
-                Write-Host "  - $($sg.SecurityGroupId)" -ForegroundColor White
+                Write-Host "  - $($sg.GroupId) ($($sg.GroupName))" -ForegroundColor White
             }
-        }
-          Write-Host "`nPlain list for scripting (completely unused):" -ForegroundColor Gray
+        }Write-Host "`nPlain list for scripting (completely unused):" -ForegroundColor Gray
         foreach ($sg in $sgCompletelyUnused) {
-            Write-Host "$($sg.Region):$($sg.SecurityGroupId) [SAFE-TO-DELETE]" -ForegroundColor DarkRed
+            Write-Host "$($sg.Region):$($sg.GroupId) [SAFE-TO-DELETE]" -ForegroundColor DarkRed
         }
     }
 
@@ -203,11 +359,39 @@ if ($Verbose) {
         foreach ($regionGroup in $groupedWithNI) {
             Write-Host "`nRegion: $($regionGroup.Name)" -ForegroundColor Cyan
             foreach ($sg in $regionGroup.Group) {
-                Write-Host "  - $($sg.SecurityGroupId)" -ForegroundColor White
+                Write-Host "  - $($sg.GroupId) ($($sg.GroupName))" -ForegroundColor White
             }
-        }    Write-Host "`nPlain list for scripting (with network interfaces):" -ForegroundColor Gray
+        }
+
+        Write-Host "`nPlain list for scripting (with network interfaces):" -ForegroundColor Gray
         foreach ($sg in $sgWithNetworkInterfaces) {
-            Write-Host "$($sg.Region):$($sg.SecurityGroupId) [HAS-NETWORK-INTERFACES]" -ForegroundColor DarkYellow
+            Write-Host "$($sg.Region):$($sg.GroupId) [HAS-NETWORK-INTERFACES]" -ForegroundColor DarkYellow
+        }
+    }
+
+    # Output security groups referenced by other security groups
+    Write-Host "`n" + "-"*80 -ForegroundColor Yellow
+    Write-Host "Security Groups with NO Instances BUT Referenced by Other Security Groups (Review Before Deleting)" -ForegroundColor Yellow
+    Write-Host "-"*80 -ForegroundColor Yellow
+
+    if ($sgReferencedByOtherSGs.Count -eq 0) {
+        Write-Host "No security groups found that are referenced by other security groups but have no instances." -ForegroundColor Green
+    } else {
+        Write-Host "Found $($sgReferencedByOtherSGs.Count) security group(s) referenced by other security groups:" -ForegroundColor Yellow
+        
+        # Group by region for better display
+        $groupedReferencedSGs = $sgReferencedByOtherSGs | Group-Object -Property Region
+        
+        foreach ($regionGroup in $groupedReferencedSGs) {
+            Write-Host "`nRegion: $($regionGroup.Name)" -ForegroundColor Cyan
+            foreach ($sg in $regionGroup.Group) {
+                Write-Host "  - $($sg.GroupId) ($($sg.GroupName))" -ForegroundColor White
+            }
+        }
+        
+        Write-Host "`nPlain list for scripting (referenced by other SGs):" -ForegroundColor Gray
+        foreach ($sg in $sgReferencedByOtherSGs) {
+            Write-Host "$($sg.Region):$($sg.GroupId) [REFERENCED-BY-OTHER-SGs]" -ForegroundColor DarkYellow
         }
     }
 }
@@ -218,30 +402,33 @@ Write-Host "FINAL SUMMARY" -ForegroundColor Magenta
 Write-Host "="*80 -ForegroundColor Magenta
 Write-Host "Total Security Groups with no EC2 instances: $($unusedSecurityGroups.Count)" -ForegroundColor Yellow
 Write-Host "  ├─ Completely unused (safe to delete): $($sgCompletelyUnused.Count)" -ForegroundColor Red
-Write-Host "  └─ Attached to network interfaces (review needed): $($sgWithNetworkInterfaces.Count)" -ForegroundColor Yellow
+Write-Host "  ├─ Attached to network interfaces (review needed): $($sgWithNetworkInterfaces.Count)" -ForegroundColor Yellow
+Write-Host "  └─ Referenced by other security groups (review needed): $($sgReferencedByOtherSGs.Count)" -ForegroundColor Yellow
 
-if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0) {
+if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0 -or $sgReferencedByOtherSGs.Count -gt 0) {
     Write-Host "`nBreakdown by region:" -ForegroundColor Cyan
     foreach ($region in $Regions) {
         $completelyUnusedInRegion = ($sgCompletelyUnused | Where-Object { $_.Region -eq $region }).Count
         $withNIInRegion = ($sgWithNetworkInterfaces | Where-Object { $_.Region -eq $region }).Count
-        if ($completelyUnusedInRegion -gt 0 -or $withNIInRegion -gt 0) {
-            Write-Host "  $region`: $completelyUnusedInRegion completely unused, $withNIInRegion with network interfaces" -ForegroundColor White
+        $referencedInRegion = ($sgReferencedByOtherSGs | Where-Object { $_.Region -eq $region }).Count
+        if ($completelyUnusedInRegion -gt 0 -or $withNIInRegion -gt 0 -or $referencedInRegion -gt 0) {
+            Write-Host "  $region`: $completelyUnusedInRegion completely unused, $withNIInRegion with network interfaces, $referencedInRegion referenced by other SGs" -ForegroundColor White
         }
     }
     
     # Combined list with clear labels
     Write-Host "`nCOMBINED LIST (All unused security groups with status):" -ForegroundColor Magenta
-    Write-Host "Legend: [SAFE-TO-DELETE] = No instances, no network interfaces" -ForegroundColor DarkRed
+    Write-Host "Legend: [SAFE-TO-DELETE] = No instances, no network interfaces, not referenced" -ForegroundColor DarkRed
     Write-Host "        [HAS-NETWORK-INTERFACES] = No instances, but has network interfaces" -ForegroundColor DarkYellow
+    Write-Host "        [REFERENCED-BY-OTHER-SGs] = No instances, but referenced by other security groups" -ForegroundColor DarkYellow
     Write-Host ""
-    
-    # Sort by region then by security group ID for consistent output
+      # Sort by region then by security group ID for consistent output
     $allUnused = @()
     foreach ($sg in $sgCompletelyUnused) {
         $allUnused += [PSCustomObject]@{
             Region = $sg.Region
-            SecurityGroupId = $sg.SecurityGroupId
+            SecurityGroupId = $sg.GroupId
+            SecurityGroupName = $sg.GroupName
             Status = "SAFE-TO-DELETE"
             Color = "DarkRed"
         }
@@ -249,13 +436,22 @@ if ($sgCompletelyUnused.Count -gt 0 -or $sgWithNetworkInterfaces.Count -gt 0) {
     foreach ($sg in $sgWithNetworkInterfaces) {
         $allUnused += [PSCustomObject]@{
             Region = $sg.Region
-            SecurityGroupId = $sg.SecurityGroupId
+            SecurityGroupId = $sg.GroupId
+            SecurityGroupName = $sg.GroupName
             Status = "HAS-NETWORK-INTERFACES"
             Color = "DarkYellow"
         }
     }
-    
-    $sortedUnused = $allUnused | Sort-Object Region, SecurityGroupId
+    foreach ($sg in $sgReferencedByOtherSGs) {
+        $allUnused += [PSCustomObject]@{
+            Region = $sg.Region
+            SecurityGroupId = $sg.GroupId
+            SecurityGroupName = $sg.GroupName
+            Status = "REFERENCED-BY-OTHER-SGs"
+            Color = "DarkYellow"
+        }
+    }
+      $sortedUnused = $allUnused | Sort-Object Region, SecurityGroupId
     foreach ($sg in $sortedUnused) {
         Write-Host "$($sg.Region):$($sg.SecurityGroupId) [$($sg.Status)]" -ForegroundColor $sg.Color
     }
